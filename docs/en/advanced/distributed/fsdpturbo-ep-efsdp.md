@@ -38,7 +38,14 @@ The following advanced fields are optional and are therefore omitted from the mi
 
 The model spec determines the EFSDP targets. Non-expert parameters such as attention, embeddings, and the LM head do not enter the FSDPTurbo EFSDP plan. They remain managed by the outer LlamaFactory FSDP2 layer.
 
-Model-specific module paths and preparation logic are managed exclusively by the `FSDPTurboEPModelSpec` registry. Built-in specs currently cover `qwen3_moe` and `qwen3_5_moe`; unregistered models fail with an explicit error. `ep_modules` and `ep_fsdp_modules` are not YAML options, and strict parameter parsing rejects them to prevent configuration from drifting away from the actual model structure.
+Model-specific module paths and preparation logic are managed exclusively by the `FSDPTurboEPModelSpec` registry. Built-in specs currently cover `qwen3_moe`, `qwen3_5_moe`, and `bailing_hybrid`; unregistered models fail with an explicit error. `ep_modules` and `ep_fsdp_modules` are not YAML options, and strict parameter parsing rejects them to prevent configuration from drifting away from the actual model structure.
+
+`bailing_hybrid` (Ling 3.0 / BailingMoE V3 remote code) keeps the routed experts in an `nn.ModuleList` and runs them with a Python loop, which is not the fused layout the EP dispatcher consumes. The spec therefore rewrites the routed experts of every sparse MoE block into one fused block exposing `gate_up_proj` / `down_proj` / `hidden_dim` and the `(hidden_states, top_k_index, top_k_weights)` entry point, and rewrites the MoE block `forward` to call it. Two constraints follow from that rewrite:
+
+- The fusion happens at sharding time, so the fused parameter names no longer match the Hugging Face checkpoint keys. `init_config: init_on_meta` and `init_on_rank0` would silently skip the expert weights and are rejected; leave `init_config` unset so the weights are loaded by Transformers before sharding.
+- LoRA cannot be injected into the routed experts, because they no longer exist as `nn.Linear` layers when PEFT runs. List the attention projections in `peft_config.target_modules` instead of `all`, or keep `ep_size: 1` and use the plain FSDP2 path.
+
+`ep_size` must divide the data parallel size and the number of routed experts (128 for Ling 3.0 tiny). Keep `ep_size` equal to the data parallel size so that no expert fully-sharded dimension is created: the layers below `first_k_dense_replace` are dense MLPs without routed experts, and an EFSDP plan matching `model.layers.{*}.mlp` would shard them as expert modules as well.
 
 ## 2. Mesh Initialization
 

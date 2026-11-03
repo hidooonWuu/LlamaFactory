@@ -39,11 +39,20 @@ from ..config.model_args import ModelArguments, ModelClass
 from ..utils import logging
 from ..utils.helper import get_tokenizer, is_tokenizer
 from ..utils.packages import check_version
-from ..utils.types import HFConfig, HFModel, Processor
+from ..utils.types import AttentionFunction, HFConfig, HFModel, Processor
 from .rendering import Renderer
 
 
 logger = logging.get_logger(__name__)
+
+
+#: Model types whose attention path can only run with one implementation.
+#: ``bailing_hybrid`` always calls ``eager_attention_forward`` inside its remote-code MLA and relies on a
+#: 4D mask for causality. With ``flash_attention_2`` the model passes a 2D padding mask (breaking the mask
+#: slicing) or drops the mask entirely, which makes the attention non-causal.
+FORCED_ATTN_IMPLEMENTATIONS = {
+    "bailing_hybrid": AttentionFunction.SDPA,
+}
 
 
 class ModelEngine:
@@ -133,6 +142,20 @@ class ModelEngine:
 
         return config
 
+    def _resolve_attn_implementation(self) -> str:
+        """Return the attention implementation to load the model with, honouring model constraints."""
+        model_type = getattr(self.model_config, "model_type", None)
+        forced = FORCED_ATTN_IMPLEMENTATIONS.get(model_type)
+        if forced is None or self.args.flash_attn == forced:
+            return str(self.args.flash_attn)
+
+        logger.warning_rank0(
+            f"model_type={model_type} can only run `{forced}` attention in LlamaFactory, overriding "
+            f"`flash_attn: {self.args.flash_attn}`. The remote-code attention always uses eager attention and "
+            "needs a 4D causal mask, which flash attention does not provide."
+        )
+        return str(forced)
+
     def _init_model(self) -> HFModel:
         """Init model.
 
@@ -147,7 +170,8 @@ class ModelEngine:
             init_device = DistributedInterface().current_device
 
         init_kwargs = {} if self._deepspeed_zero3_enabled else {"device_map": init_device}
-        logger.info_rank0(f"Using attention implementation: {self.args.flash_attn}.")
+        attn_implementation = self._resolve_attn_implementation()
+        logger.info_rank0(f"Using attention implementation: {attn_implementation}.")
 
         if self.args.quant_config is not None:
             from ..plugins.model_plugins.quantization import QuantizationPlugin
@@ -195,13 +219,13 @@ class ModelEngine:
         if init_device.type == DeviceType.META:
             assert self.args.quant_config is None, "Quantization is not supported with meta device."
             with init_empty_weights():
-                model = AutoClass.from_config(self.model_config, attn_implementation=self.args.flash_attn)
+                model = AutoClass.from_config(self.model_config, attn_implementation=attn_implementation)
         else:
             model = AutoClass.from_pretrained(
                 self.args.model,
                 config=self.model_config,
                 dtype="auto",
-                attn_implementation=self.args.flash_attn,
+                attn_implementation=attn_implementation,
                 trust_remote_code=self.args.trust_remote_code,
                 **init_kwargs,
             )

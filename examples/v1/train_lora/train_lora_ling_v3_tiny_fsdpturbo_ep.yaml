@@ -1,0 +1,57 @@
+### Ling 3.0 tiny (BailingMoE V3, model_type: bailing_hybrid) LoRA SFT on Ascend NPU with
+### FSDPTurbo expert parallelism (EP). `ep_size` must divide both the data parallel size and the
+### number of routed experts (128 for Ling 3.0 tiny), and `global_batch_size` must stay divisible by
+### `dp_size * micro_batch_size`.
+###
+### Usage: USE_V1=1 NPROC_PER_NODE=8 llamafactory-cli sft examples/v1/train_lora/train_lora_ling_v3_tiny_fsdpturbo_ep.yaml
+model: /home/wuhaidong/model
+model_class: llm
+trust_remote_code: true
+# The remote-code MLA always runs eager attention and needs a 4D causal mask, so LlamaFactory
+# forces `sdpa` for bailing_hybrid even if `flash_attention_2` is requested here.
+flash_attn: sdpa
+
+peft_config:
+  name: lora
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  # Expert parallelism rewrites the routed experts (`mlp.experts.{gate,up,down}_proj`) into fused
+  # grouped-matmul weights, so LoRA must stay on the attention projections. `target_modules: all`
+  # would also adapt the routed experts and is rejected by the FSDPTurbo EP adapter.
+  target_modules:
+    - q_a_proj
+    - q_b_proj
+    - kv_a_proj_with_mqa
+    - kv_b_proj
+    - dense
+    - q_proj
+    - k_proj
+    - v_proj
+    - f_proj
+    - b_proj
+    - g_proj
+    - o_proj
+
+dist_config:
+  name: fsdpturbo
+  ep_size: 8
+  ep_dispatcher: eager
+
+### data
+train_dataset: data/v1_sft_demo.yaml
+
+### training
+output_dir: outputs/ling_lora_ep
+micro_batch_size: 1
+global_batch_size: 8
+cutoff_len: 2048
+learning_rate: 1.0e-4
+max_steps: 3
+logging_steps: 1
+bf16: true
+enable_activation_checkpointing: true
+
+### sample
+sample_backend: hf
+max_new_tokens: 128

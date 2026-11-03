@@ -125,6 +125,14 @@ kernel_config:
 
 `liger_kernel` 接受 CUDA 或 NPU，但仍要求模型类型在当前 Liger 映射中，并且已安装兼容版本的 `liger_kernel`。
 
+## Ling 3.0（bailing_hybrid）
+
+Ling 3.0 使用 remote code，`model_type` 为 `bailing_hybrid`，需要 `trust_remote_code: true`。在 NPU 上运行该模型前需要额外满足：
+
+- 安装 `fla-core`（`python -m pip install -U fla-core`）。remote code 在 import 阶段就会加载 `fla` 的 KDA 算子与 `ShortConvolution`、`FusedRMSNormGated`，缺少该依赖会直接失败；KDA 的 triton 算子需要在 NPU 上可用的 Triton 实现。
+- `flash_attn` 只能使用 `sdpa`。该模型的 MLA 内部固定走 eager attention，依赖 4D causal mask，`flash_attention_2` 只会拿到 2D padding mask 或直接丢掉 mask，因此 LlamaFactory 会强制把 `bailing_hybrid` 的 attention 实现改为 `sdpa`。这也意味着该模型不能使用依赖 `flash_attention_2` 的 Ulysses CP。
+- LoRA 与 FSDPTurbo 的配置见 `examples/v1/train_lora/train_lora_ling_v3_tiny_fsdpturbo.yaml`（`ep_size: 1`）和 `examples/v1/train_lora/train_lora_ling_v3_tiny_fsdpturbo_ep.yaml`（专家并行）。专家并行下不能在路由专家上挂 LoRA，`target_modules` 需要写成 attention 投影的显式列表，详见[分布式训练](../../feature-guide/distributed_training.md#专家并行模型支持)。
+
 ## 分布式训练
 
 FSDP2、FSDPTurbo 与 Ulysses 使用 accelerator 抽象选择 NPU 通信设备。DeepSpeed 的可用性由 NPU DeepSpeed 发行版、依赖版本和配置共同决定。

@@ -24,6 +24,7 @@ Including:
 - Synchronize processes and ensure main-process-first execution order
 """
 
+import importlib.util
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -35,7 +36,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from ..utils import logging
 from ..utils.types import ProcessGroup, Tensor, TensorLike
+
+
+logger = logging.get_logger(__name__)
 
 
 @unique
@@ -102,8 +107,29 @@ def get_local_world_size() -> int:
 @requires_accelerator
 def get_current_accelerator(check_available: bool = True) -> torch.device:
     """Get current accelerator."""
+    _import_plugin_accelerator()
     accelerator = torch.accelerator.current_accelerator(check_available=check_available)
     return accelerator or torch.device(DeviceType.CPU.value)
+
+
+@requires_accelerator
+def _import_plugin_accelerator() -> None:
+    """Import an accelerator backend that ``torch.accelerator`` cannot discover on its own.
+
+    Ascend NPU is registered as the renamed ``privateuse1`` backend, which only becomes visible to
+    ``torch.accelerator`` after ``torch_npu`` is imported. Without it, an NPU host silently falls
+    back to the CPU device and the gloo process group.
+    """
+    if torch.accelerator.current_accelerator(check_available=True) is not None:
+        return
+
+    if importlib.util.find_spec("torch_npu") is None:
+        return
+
+    try:
+        import torch_npu  # noqa: F401
+    except Exception:  # the backend is optional and may be unusable in this environment
+        logger.warning_rank0_once("torch_npu is installed but could not be imported, ignoring the NPU backend.")
 
 
 @lru_cache

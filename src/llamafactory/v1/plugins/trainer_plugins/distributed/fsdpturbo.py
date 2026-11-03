@@ -266,6 +266,18 @@ def _prepare_qwen3_5_moe_for_ep(model: HFModel) -> HFModel:
     return model
 
 
+@FSDPTurboEPModelSpec.register(
+    "bailing_hybrid",
+    ep_modules=["model.layers.{*}.mlp.experts"],
+    ep_fsdp_modules=["model.layers.{*}.mlp"],
+)
+def _prepare_bailing_hybrid_for_ep(model: HFModel) -> HFModel:
+    """Ling 3.0 / BailingMoE V3 stores the routed experts as a module list and needs fusing."""
+    from .expert_adapters import bailing_hybrid
+
+    return bailing_hybrid.prepare_for_ep(model)
+
+
 class FSDPTurboFSDP2Engine(FSDP2Engine):
     """FSDPTurbo EP adapter that reuses LlamaFactory's init/load flow.
 
@@ -352,6 +364,23 @@ class FSDPTurboFSDP2Engine(FSDP2Engine):
 
         param.data.copy_(loaded_tensor)
 
+    @staticmethod
+    def _freeze_expert_parallel_params(model: HFModel, ep_modules: list[str]) -> None:
+        """Keep the EP-managed expert parameters frozen in LoRA runs."""
+        from fsdp_turbo.utils.str_match import module_name_match
+
+        frozen = 0
+        for name, module in model.named_modules():
+            if not any(module_name_match(pattern, name) for pattern in ep_modules):
+                continue
+
+            for param in module.parameters(recurse=True):
+                param.requires_grad_(False)
+                frozen += 1
+
+        if frozen:
+            logger.info_rank0(f"FSDPTurbo FSDP2: kept {frozen} routed expert parameters frozen for LoRA.")
+
     def prepare_model_ep(self, model: HFModel) -> tuple[HFModel, set]:
         """Apply FSDPTurbo EP/EFSDP and return parameters excluded from outer FSDP."""
         from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import (
@@ -408,6 +437,11 @@ class FSDPTurboFSDP2Engine(FSDP2Engine):
                 logger.info(f"FSDPTurbo EP gradient divide factor: {ep_plan.gradient_divide_factor}")
 
             ep_target_model = expert_parallelize_modules(ep_target_model, ep_mesh, ep_plan)
+
+            if self.is_lora_module_wrap(model):
+                # FSDPTurbo re-creates the sharded expert parameters with requires_grad=True, which
+                # would silently turn a LoRA run into a full tuning run of the routed experts.
+                self._freeze_expert_parallel_params(ep_target_model, ep_modules)
 
             if self.ep_fsdp_size > 1:
                 if self.rank == 0:
