@@ -186,3 +186,109 @@ def test_kda_inference_and_long_inputs_keep_original_path(training, length):
     output = attention(hidden, past_key_value=cache)
     assert output[0] is hidden
     assert output[1:] == ("original", cache)
+
+
+@pytest.mark.parametrize("implementation", ["sdpa", "flash_attention_2"])
+def test_mla_dispatch_is_local_and_preserves_attention_arguments(monkeypatch, implementation):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from transformers.integrations import flash_attention
+
+    class MLA(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(_attn_implementation=implementation)
+
+    module = ModuleType("ling_flash_dispatch_test")
+    module.BailingMoeV3MultiLatentAttention = MLA
+    eager = module.eager_attention_forward = Mock(return_value=("eager", None))
+    flash = Mock(return_value=("flash", None))
+    monkeypatch.setattr(flash_attention, "flash_attention_forward", flash)
+    bailing_hybrid._patch_mla_flash_attention(module)
+    patched = module.eager_attention_forward
+    bailing_hybrid._patch_mla_flash_attention(module)
+    assert module.eager_attention_forward is patched
+    attention = MLA()
+    q, k, v = (torch.randn(1, 2, 4, 8) for _ in range(3))
+    mask = torch.ones(1, 4) if implementation == "flash_attention_2" else torch.zeros(1, 1, 4, 4)
+    result = patched(attention, q, k, v, mask, scaling=0.25, dropout=0.1)
+    selected, other = (flash, eager) if implementation == "flash_attention_2" else (eager, flash)
+    selected.assert_called_once_with(attention, q, k, v, mask, scaling=0.25, dropout=0.1)
+    other.assert_not_called()
+    assert result[0] == ("flash" if implementation == "flash_attention_2" else "eager")
+    # Other attention classes sharing the remote module keep their original path.
+    patched(SimpleNamespace(), q, k, v, mask)
+    assert eager.call_count == (1 if implementation == "flash_attention_2" else 2)
+
+
+def test_mla_flash_rejects_incompatible_mask_and_attention_weights():
+    from types import SimpleNamespace
+
+    class MLA:
+        config = SimpleNamespace(_attn_implementation="flash_attention_2")
+
+    module = ModuleType("ling_flash_invalid_inputs")
+    module.BailingMoeV3MultiLatentAttention = MLA
+    module.eager_attention_forward = lambda *args, **kwargs: None
+    bailing_hybrid._patch_mla_flash_attention(module)
+    q = torch.randn(1, 2, 4, 8)
+    with pytest.raises(ValueError, match="2D padding mask"):
+        module.eager_attention_forward(MLA(), q, q, q, torch.ones(1, 1, 4, 4))
+    with pytest.raises(ValueError, match="cannot return attention weights"):
+        module.eager_attention_forward(MLA(), q, q, q, None, output_attentions=True)
+
+
+@pytest.mark.parametrize("query_length,key_length", [(4, 4), (2, 6), (1, 7)])
+def test_legacy_mla_restores_missing_causal_mask(query_length, key_length):
+    from types import SimpleNamespace
+
+    class MLA:
+        config = SimpleNamespace(_attn_implementation="sdpa")
+
+    def eager(attention, q, k, v, mask, **kwargs):
+        weights = (q @ k.transpose(-1, -2) + mask).softmax(-1)
+        return weights @ v, weights
+
+    module = ModuleType("ling_missing_causal_mask")
+    module.BailingMoeV3MultiLatentAttention = MLA
+    module.eager_attention_forward = eager
+    bailing_hybrid._patch_mla_flash_attention(module)
+    q = torch.zeros(1, 1, query_length, 8)
+    k = torch.zeros(1, 1, key_length, 8)
+    v = torch.arange(key_length).float()[None, None, :, None].expand(1, 1, key_length, 8)
+    _, weights = module.eager_attention_forward(MLA(), q, k, v, None)
+    forbidden = torch.ones(query_length, key_length, dtype=torch.bool).triu(key_length - query_length + 1)
+    assert (weights[0, 0][forbidden] == 0).all()
+    torch.testing.assert_close(weights.sum(-1), torch.ones(1, 1, query_length))
+    padding = torch.ones(1, key_length)
+    padding[:, 0] = 0
+    _, weights = module.eager_attention_forward(MLA(), q, k, v, padding)
+    valid_queries = padding[0, -query_length:].bool()
+    assert (weights[0, 0, valid_queries, 0] == 0).all()
+
+
+def test_transformers4_gets_mla_dispatch_without_tf5_rope_changes(monkeypatch, config):
+    import sys
+
+    module = ModuleType("ling_tf4_flash_dispatch")
+
+    class MLA:
+        pass
+
+    module.BailingMoeV3MultiLatentAttention = MLA
+    module.eager_attention_forward = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    class Model:
+        pass
+
+    Model.__module__ = module.__name__
+    config.auto_map = {"AutoModelForCausalLM": "modeling_ling.Model"}
+    original = deepcopy(config.to_dict())
+    monkeypatch.setattr(bailing_hybrid, "is_transformers_version_greater_than", lambda _: False)
+    monkeypatch.setattr(bailing_hybrid, "get_class_from_dynamic_module", lambda *args: Model)
+    bailing_hybrid.prepare_bailing_hybrid_model(config, "unused", AutoModelForCausalLM, True)
+    assert module._llamafactory_mla_flash_attention
+    assert not hasattr(module, "_llamafactory_tf5_compat")
+    assert config.to_dict() == original

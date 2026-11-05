@@ -75,6 +75,8 @@ def main():
     parser.add_argument("--threshold-percent", type=float, default=2.0)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--reference-label", default="FSDP2")
+    parser.add_argument("--candidate-label", default="FSDPTurbo EP")
     args = parser.parse_args()
     summary, rows = compare(args.reference, args.candidate, args.expected_steps, args.threshold_percent)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -91,8 +93,10 @@ def main():
 
         fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True, layout="constrained")
         steps = [row["step"] for row in rows]
-        axes[0].plot(steps, [row["reference_loss"] for row in rows], label="FSDP2", linewidth=1)
-        axes[0].plot(steps, [row["candidate_loss"] for row in rows], label="FSDPTurbo EP", linewidth=1, alpha=0.8)
+        axes[0].plot(steps, [row["reference_loss"] for row in rows], label=args.reference_label, linewidth=1)
+        axes[0].plot(
+            steps, [row["candidate_loss"] for row in rows], label=args.candidate_label, linewidth=1, alpha=0.8
+        )
         axes[0].set_ylabel("Training loss")
         axes[0].legend()
         axes[0].set_title(

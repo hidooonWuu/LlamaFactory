@@ -47,6 +47,8 @@ Model-specific module paths and preparation logic are managed exclusively by the
 - Expert A/B gradients are averaged over the EP group, while input gradients retain the normal token-routing semantics. Adapter storage remains FP32. Gathered adapter checkpoints are expanded back into standard per-expert PEFT keys for loading into the original unfused model.
 - Native FSDP2 groups Ling expert adapters per MoE block to avoid thousands of tiny collectives. Frozen expert base weights remain replicated in this LoRA grouping path; adapter parameters are sharded. This changes memory usage, while preserving PEFT computation and checkpoint keys.
 
+Ling MLA also supports `flash_attn: flash_attention_2` through the LlamaFactory model plugin. Its remote projections, RoPE, scaling, cache, value padding and output gating remain intact; only the hard-coded eager kernel is dispatched to Transformers FA2 (Ascend uses `torch_npu.npu_fusion_attention`). KDA continues to use FLA. The legacy `sdpa` option still uses eager MLA, with an explicit causal-mask repair when the SDPA mask helper returns `None`. Numerical FA2 comparisons must use this corrected causal baseline; earlier backend agreement alone does not validate causality. This path requires `cp_size: 1` because KDA context parallelism is not implemented; padding-free support is not established by these tests.
+
 `ep_size` must divide the data parallel size and the number of routed experts (128 for Ling 3.0 tiny). Keep `ep_size` equal to the data parallel size so that no expert fully-sharded dimension is created: the layers below `first_k_dense_replace` are dense MLPs without routed experts, and an EFSDP plan matching `model.layers.{*}.mlp` would shard them as expert modules as well.
 
 ## 2. Mesh Initialization

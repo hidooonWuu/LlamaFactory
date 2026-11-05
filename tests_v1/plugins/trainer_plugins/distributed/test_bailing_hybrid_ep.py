@@ -232,13 +232,13 @@ def test_bailing_hybrid_rejects_meta_init():
         bailing_hybrid.prepare_for_ep(model)
 
 
-def test_bailing_hybrid_forces_sdpa_attention():
+def test_bailing_hybrid_allows_patched_flash_attention():
     assert FORCED_ATTN_IMPLEMENTATIONS["bailing_hybrid"] == AttentionFunction.SDPA
 
     engine = object.__new__(ModelEngine)
     engine.model_config = SimpleNamespace(model_type="bailing_hybrid")
     engine.args = SimpleNamespace(flash_attn=AttentionFunction.FLASH_ATTENTION_2)
-    assert engine._resolve_attn_implementation() == "sdpa"
+    assert engine._resolve_attn_implementation() == "flash_attention_2"
 
     engine.args = SimpleNamespace(flash_attn=AttentionFunction.SDPA)
     assert engine._resolve_attn_implementation() == "sdpa"
@@ -284,3 +284,11 @@ def test_expert_lora_rejects_inconsistent_or_unsupported_layouts(mismatch):
         layer.set_adapter(["default", "other"])
     with pytest.raises(ValueError, match="Expert LoRA|Ling EP"):
         bailing_hybrid.prepare_for_ep(model)
+
+
+def test_ling_flash_attention_rejects_unsupported_kda_context_parallelism():
+    engine = object.__new__(ModelEngine)
+    engine.model_config = SimpleNamespace(model_type="bailing_hybrid")
+    engine.args = SimpleNamespace(flash_attn=AttentionFunction.FLASH_ATTENTION_2, cp_size=2)
+    with pytest.raises(ValueError, match="cp_size=1"):
+        engine._resolve_attn_implementation()

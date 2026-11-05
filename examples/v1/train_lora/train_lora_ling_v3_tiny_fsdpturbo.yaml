@@ -6,8 +6,8 @@
 model: /home/wuhaidong/model
 model_class: llm
 trust_remote_code: true
-# The remote-code MLA always runs eager attention and needs a 4D causal mask, so LlamaFactory
-# forces `sdpa` for bailing_hybrid even if `flash_attention_2` is requested here.
+# sdpa selects legacy eager MLA with an explicit causal mask.
+# flash_attention_2 selects the patched Transformers FA2 path (Ascend fused attention).
 flash_attn: sdpa
 
 peft_config:

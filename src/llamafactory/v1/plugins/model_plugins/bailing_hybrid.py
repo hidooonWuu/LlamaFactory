@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Adapt Ling's remote model code to Transformers 5 without editing checkpoint files."""
+"""Adapt Ling's attention and Transformers 5 compatibility without editing checkpoint files."""
 
 import sys
 from copy import deepcopy
@@ -102,7 +102,53 @@ def _patch_kda_training(module) -> None:
     attention._llamafactory_chunk_training = True
 
 
+def _patch_mla_flash_attention(module) -> None:
+    """Dispatch Ling MLA to HF FA2 (Ascend uses torch_npu fusion attention).
+
+    Keep the remote forward's Q/K/V projections, value padding, RoPE, cache,
+    scaling and output gating. Only replace its hard-coded eager kernel. The
+    enclosing model already supplies FA2's 2D padding mask in this mode.
+    """
+    if getattr(module, "_llamafactory_mla_flash_attention", False):
+        return
+    eager = getattr(module, "eager_attention_forward", None)
+    attention_class = getattr(module, "BailingMoeV3MultiLatentAttention", None)
+    if eager is None or attention_class is None:
+        return
+
+    @wraps(eager)
+    def attention_forward(attention, query, key, value, attention_mask, **kwargs):
+        is_mla = isinstance(attention, attention_class)
+        if is_mla and attention.config._attn_implementation == "flash_attention_2":
+            from transformers.integrations.flash_attention import flash_attention_forward
+
+            if attention_mask is not None and attention_mask.ndim != 2:
+                raise ValueError("Ling FlashAttention 2 requires a 2D padding mask or None.")
+            if kwargs.get("output_attentions", False):
+                raise ValueError("Ling FlashAttention 2 cannot return attention weights; use sdpa/eager instead.")
+            return flash_attention_forward(attention, query, key, value, attention_mask, **kwargs)
+        if is_mla and (attention_mask is None or attention_mask.ndim == 2):
+            # The SDPA mask helper may return None for all-valid inputs because
+            # real SDPA applies is_causal itself. Ling's eager kernel does not.
+            # Restore an explicit bottom-right-aligned causal mask, including
+            # chunked cache decoding where query and key lengths differ.
+            q_len, kv_len = query.shape[-2], key.shape[-2]
+            causal_mask = torch.full(
+                (q_len, kv_len), torch.finfo(query.dtype).min, dtype=query.dtype, device=query.device
+            ).triu(kv_len - q_len + 1)[None, None]
+            if attention_mask is not None:
+                causal_mask = causal_mask.expand(query.shape[0], 1, q_len, kv_len).masked_fill(
+                    ~attention_mask[:, None, None, :kv_len].bool(), torch.finfo(query.dtype).min
+                )
+            attention_mask = causal_mask
+        return eager(attention, query, key, value, attention_mask, **kwargs)
+
+    module.eager_attention_forward = attention_forward
+    module._llamafactory_mla_flash_attention = True
+
+
 def _patch_model_module(module) -> None:
+    _patch_mla_flash_attention(module)
     if getattr(module, "_llamafactory_tf5_compat", False):
         return
 
@@ -142,11 +188,7 @@ def _patch_model_module(module) -> None:
 
 def prepare_bailing_hybrid_model(config, model_path: str, auto_class, trust_remote_code: bool) -> None:
     """Patch the imported model classes before AutoModel constructs the model."""
-    if (
-        config.model_type != "bailing_hybrid"
-        or not trust_remote_code
-        or not is_transformers_version_greater_than("5.0.0")
-    ):
+    if config.model_type != "bailing_hybrid" or not trust_remote_code:
         return
 
     reference = getattr(config, "auto_map", {}).get(auto_class.__name__)
@@ -165,4 +207,8 @@ def prepare_bailing_hybrid_model(config, model_path: str, auto_class, trust_remo
             if missing_fx_helper:
                 del import_utils.is_torch_fx_available
 
-        _patch_model_module(sys.modules[model_class.__module__])
+        module = sys.modules[model_class.__module__]
+        if is_transformers_version_greater_than("5.0.0"):
+            _patch_model_module(module)
+        else:
+            _patch_mla_flash_attention(module)

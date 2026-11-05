@@ -46,10 +46,9 @@ from .rendering import Renderer
 logger = logging.get_logger(__name__)
 
 
-#: Model types whose attention path can only run with one implementation.
-#: ``bailing_hybrid`` always calls ``eager_attention_forward`` inside its remote-code MLA and relies on a
-#: 4D mask for causality. With ``flash_attention_2`` the model passes a 2D padding mask (breaking the mask
-#: slicing) or drops the mask entirely, which makes the attention non-causal.
+#: Mask-preparation fallbacks for legacy attention paths.
+#: Ling's legacy eager path needs SDPA's 4D mask. Its explicit FA2 path is
+#: separately patched by the model plugin and bypasses this fallback.
 FORCED_ATTN_IMPLEMENTATIONS = {
     "bailing_hybrid": AttentionFunction.SDPA,
 }
@@ -149,14 +148,19 @@ class ModelEngine:
     def _resolve_attn_implementation(self) -> str:
         """Return the attention implementation to load the model with, honouring model constraints."""
         model_type = getattr(self.model_config, "model_type", None)
+        if model_type == "bailing_hybrid" and self.args.flash_attn == AttentionFunction.FLASH_ATTENTION_2:
+            if getattr(self.args, "cp_size", 1) > 1:
+                raise ValueError(
+                    "Ling FlashAttention 2 currently requires cp_size=1; KDA context parallelism is unsupported."
+                )
+            return str(self.args.flash_attn)
         forced = FORCED_ATTN_IMPLEMENTATIONS.get(model_type)
         if forced is None or self.args.flash_attn == forced:
             return str(self.args.flash_attn)
 
         logger.warning_rank0(
-            f"model_type={model_type} can only run `{forced}` attention in LlamaFactory, overriding "
-            f"`flash_attn: {self.args.flash_attn}`. The remote-code attention always uses eager attention and "
-            "needs a 4D causal mask, which flash attention does not provide."
+            f"model_type={model_type} uses `{forced}` mask preparation for legacy attention, overriding "
+            f"`flash_attn: {self.args.flash_attn}`. Select `flash_attention_2` to use the patched FA2 path."
         )
         return str(forced)
 
