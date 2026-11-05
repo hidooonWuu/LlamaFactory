@@ -1,0 +1,36 @@
+### Ling 3.0 tiny LoRA SFT on Ascend NPU with native FSDP2.
+### Use the same all-linear LoRA targets as the EP example for loss comparisons.
+### Usage: USE_V1=1 NPROC_PER_NODE=2 llamafactory-cli sft examples/v1/train_lora/train_lora_ling_v3_tiny_fsdp.yaml
+model: /home/wuhaidong/model
+model_class: llm
+trust_remote_code: true
+# The remote-code MLA always runs eager attention and needs a 4D causal mask, so LlamaFactory
+# forces `sdpa` for bailing_hybrid even if `flash_attention_2` is requested here.
+flash_attn: sdpa
+
+peft_config:
+  name: lora
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: all
+
+dist_config:
+  name: fsdp2
+  dcp_path: null
+
+### data
+train_dataset: /home/wuhaidong/code/LlamaFactory/data/v1_sft_demo.yaml
+
+### training
+output_dir: /home/wuhaidong/output/train_lora_ling_v3_tiny_fsdp2
+micro_batch_size: 1
+global_batch_size: 2
+batching_workers: 0
+cutoff_len: 2048
+learning_rate: 1.0e-4
+max_steps: 250
+logging_steps: 1
+bf16: true
+enable_activation_checkpointing: true
+seed: 42

@@ -137,6 +137,10 @@ class ModelEngine:
             self.args.model,
             trust_remote_code=self.args.trust_remote_code,
         )
+        if getattr(config, "model_type", None) == "bailing_hybrid":
+            from ..plugins.model_plugins.bailing_hybrid import patch_bailing_hybrid_config
+
+            patch_bailing_hybrid_config(config)
         if getattr(config, "model_type", None) == "xing4_0":
             check_version("transformers>=5.4.0", mandatory=True)
 
@@ -216,10 +220,19 @@ class ModelEngine:
 
             AutoClass = AutoModel
 
+        if getattr(self.model_config, "model_type", None) == "bailing_hybrid":
+            from ..plugins.model_plugins.bailing_hybrid import prepare_bailing_hybrid_model
+
+            prepare_bailing_hybrid_model(self.model_config, self.args.model, AutoClass, self.args.trust_remote_code)
+
         if init_device.type == DeviceType.META:
             assert self.args.quant_config is None, "Quantization is not supported with meta device."
             with init_empty_weights():
-                model = AutoClass.from_config(self.model_config, attn_implementation=attn_implementation)
+                model = AutoClass.from_config(
+                    self.model_config,
+                    attn_implementation=attn_implementation,
+                    trust_remote_code=self.args.trust_remote_code,
+                )
         else:
             model = AutoClass.from_pretrained(
                 self.args.model,

@@ -127,11 +127,21 @@ kernel_config:
 
 ## Ling 3.0（bailing_hybrid）
 
-Ling 3.0 使用 remote code，`model_type` 为 `bailing_hybrid`，需要 `trust_remote_code: true`。在 NPU 上运行该模型前需要额外满足：
+Ling 3.0 使用 remote code，`model_type` 为 `bailing_hybrid`，需要 `trust_remote_code: true`。
+
+在 Transformers 5.x 下，LlamaFactory 会在加载模型时适配旧版 FX 导入接口和 RoPE 初始化，保留检查点的 `rope_theta` 与 MLA 旋转维度，无需修改模型目录的 Python 文件。该适配已在 Transformers 5.0.0 下验证模型结构初始化和缩小 MLA 模型的前向、反向计算；完整 NPU 训练仍依赖匹配的 FLA 与 Triton 环境。
+
+适配同时处理短序列 KDA 训练：remote code 会对不超过 64 token 的输入选择 `fused_recurrent`，但训练仅支持 `chunk`，因此 LlamaFactory 对这类训练输入调用 `chunk_kda`。推理和超过 64 token 的输入保留原有执行路径。`cutoff_len` 是截断上限，不能保证实际输入长度超过 64。
+
+在 NPU 上运行该模型前需要额外满足：
 
 - 安装 `fla-core`（`python -m pip install -U fla-core`）。remote code 在 import 阶段就会加载 `fla` 的 KDA 算子与 `ShortConvolution`、`FusedRMSNormGated`，缺少该依赖会直接失败；KDA 的 triton 算子需要在 NPU 上可用的 Triton 实现。
 - `flash_attn` 只能使用 `sdpa`。该模型的 MLA 内部固定走 eager attention，依赖 4D causal mask，`flash_attention_2` 只会拿到 2D padding mask 或直接丢掉 mask，因此 LlamaFactory 会强制把 `bailing_hybrid` 的 attention 实现改为 `sdpa`。这也意味着该模型不能使用依赖 `flash_attention_2` 的 Ulysses CP。
-- LoRA 与 FSDPTurbo 的配置见 `examples/v1/train_lora/train_lora_ling_v3_tiny_fsdpturbo.yaml`（`ep_size: 1`）和 `examples/v1/train_lora/train_lora_ling_v3_tiny_fsdpturbo_ep.yaml`（专家并行）。专家并行下不能在路由专家上挂 LoRA，`target_modules` 需要写成 attention 投影的显式列表，详见[分布式训练](../../feature-guide/distributed_training.md#专家并行模型支持)。
+- LoRA 与 FSDPTurbo 的配置见 `examples/v1/train_lora/train_lora_ling_v3_tiny_fsdpturbo.yaml`（`ep_size: 1`）和 `examples/v1/train_lora/train_lora_ling_v3_tiny_fsdpturbo_ep.yaml`（专家并行）。Ling 专家并行已支持路由专家 LoRA：A/B 按专家轴打包分片，冻结的专家基座不参与训练，保存时恢复标准 PEFT 参数名。当前要求 `ep_dispatcher: eager`、`ep_size == dp_size`、单个活动的普通加性 LoRA、专家间 rank/scaling/dropout 一致，不支持 DoRA 和适配器 bias。
+
+对比 EP 与原生 FSDP2 的 loss 时，`train_lora_ling_v3_tiny_fsdpturbo_ep.yaml` 与 `train_lora_ling_v3_tiny_fsdp.yaml` 均使用 `target_modules: all`，并保持数据、种子、batch 和数据加载进程数一致。`all` 包括 attention、路由专家、共享专家和普通 MLP，不能与仅训练 attention 的结果直接比较。原生 FSDP2 将 Ling 专家适配器按 MoE 层分组分片，减少小通信；该路径的冻结专家基座保持复制，因此显存占用会增加。FSDPTurbo 在 LoRA 模式下保留适配器的 FP32 存储精度，`bf16` 控制混合精度计算，避免整模型转换把优化器更新一起舍入到 BF16。
+
+训练日志为追加写入，比较时需要分离重复启动的运行并按 step 对齐。可使用 `python scripts/stat_utils/compare_backend_losses.py <fsdp2_log> <ep_log> --expected-steps 250 --threshold-percent 2 --output-dir <report_dir> --plot` 生成完整运行的逐步误差、汇总和曲线图。平均相对误差定义为 `mean(abs(loss_ep - loss_fsdp2) / abs(loss_fsdp2))`，工具只在完整步数齐全且误差低于阈值时成功退出。
 
 ## 分布式训练
 

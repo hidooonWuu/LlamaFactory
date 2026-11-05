@@ -29,10 +29,10 @@ from collections.abc import Iterator
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .....utils.logging import get_logger
 from .....utils.types import HFModel
+from .bailing_lora import expert_mlp, pack_expert_lora
 
 
 logger = get_logger(__name__)
@@ -84,9 +84,7 @@ class FusedRoutedExperts(nn.Module):
             if token_ids.numel() == 0:
                 continue
 
-            gate_up = F.linear(flat_hidden[token_ids], self.gate_up_proj[expert_id])
-            gate, up = gate_up.chunk(2, dim=-1)
-            expert_output = F.linear(self.act_fn(gate) * up, self.down_proj[expert_id])
+            expert_output = expert_mlp(self, expert_id, flat_hidden[token_ids])
             output.index_add_(0, token_ids, expert_output * flat_weights[token_ids, slot_ids].unsqueeze(-1))
 
         return output.view(hidden_shape)
@@ -138,7 +136,7 @@ def _fuse_experts(experts: nn.ModuleList) -> FusedRoutedExperts:
         dim=0,
     )
     down_proj = torch.stack([expert.down_proj.weight.detach() for expert in experts], dim=0)
-    return FusedRoutedExperts(
+    fused = FusedRoutedExperts(
         gate_up_proj=gate_up_proj,
         down_proj=down_proj,
         act_fn=act_fn,
@@ -146,6 +144,9 @@ def _fuse_experts(experts: nn.ModuleList) -> FusedRoutedExperts:
         hidden_dim=first_expert.gate_proj.in_features,
         requires_grad=requires_grad,
     )
+    if _has_lora_layers(experts):
+        pack_expert_lora(experts, fused)
+    return fused
 
 
 def _sparse_moe_block_forward(module: nn.Module, hidden_states: torch.Tensor):
@@ -187,15 +188,6 @@ def prepare_for_ep(model: HFModel) -> HFModel:
     for block_name, block in list(_iter_sparse_moe_blocks(model)):
         if getattr(block, "_ep_fused", False):
             continue
-        if _has_lora_layers(block.experts):
-            raise RuntimeError(
-                f"LoRA adapters were found in the FSDPTurbo EP target `{block_name}.experts`. Expert "
-                "parallelism rewrites the routed experts into grouped-matmul weights, so LoRA cannot be "
-                "injected into them. Drop the routed-expert projections (`gate_proj`, `up_proj`, "
-                "`down_proj`) from `peft_config.target_modules` and list the attention projections "
-                "explicitly, or disable expert parallelism with `ep_size: 1`."
-            )
-
         block.experts = _fuse_experts(block.experts)
         block.forward = _sparse_moe_block_forward.__get__(block, type(block))
         block._ep_fused = True

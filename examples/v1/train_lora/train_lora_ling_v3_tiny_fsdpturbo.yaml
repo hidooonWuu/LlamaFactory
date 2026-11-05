@@ -22,16 +22,16 @@ dist_config:
   dcp_path: null
 
 ### data
-train_dataset: data/v1_sft_demo.yaml
+train_dataset: /home/wuhaidong/code/LlamaFactory/data/v1_sft_demo.jsonl
 
 ### training
-output_dir: outputs/ling_lora
+output_dir: /home/wuhaidong/output/train_lora_ling_v3_tiny_fsdpturbo
 micro_batch_size: 1
-global_batch_size: 1
+global_batch_size: 2
 batching_workers: 0
 cutoff_len: 2048
 learning_rate: 1.0e-4
-max_steps: 3
+max_steps: 250
 logging_steps: 1
 bf16: true
 enable_activation_checkpointing: true

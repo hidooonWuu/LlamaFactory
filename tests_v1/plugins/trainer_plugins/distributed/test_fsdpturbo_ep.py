@@ -68,6 +68,40 @@ def test_fsdpturbo_sets_storage_dtype_inside_backend(monkeypatch):
     assert engine.shard_model(model).weight.dtype == torch.bfloat16
 
 
+def test_fsdpturbo_preserves_fp32_lora_updates(monkeypatch):
+    from peft import LoraConfig, get_peft_model
+
+    from llamafactory.v1.plugins.trainer_plugins.distributed.fsdp2 import FSDP2Engine
+
+    monkeypatch.setattr(FSDP2Engine, "shard_model", lambda self, model: model)
+    engine = object.__new__(FSDPTurboFSDP2Engine)
+    engine.mixed_precision = "bf16"
+    model = get_peft_model(
+        torch.nn.Sequential(torch.nn.Linear(4, 4, dtype=torch.bfloat16)),
+        LoraConfig(r=2, target_modules=["0"]),
+    )
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.requires_grad:
+                param.fill_(1.0)
+    before = {name: param.detach().clone() for name, param in model.named_parameters() if param.requires_grad}
+    engine.shard_model(model)
+    for name, param in model.named_parameters():
+        if name in before:
+            assert param.dtype == torch.float32
+            torch.testing.assert_close(param, before[name], rtol=0, atol=0)
+    optimizer = torch.optim.SGD([param for param in model.parameters() if param.requires_grad], lr=1.0)
+    for _ in range(3):
+        for param in model.parameters():
+            if param.requires_grad:
+                param.grad = torch.full_like(param, 1e-4)
+        optimizer.step()
+    for param in model.parameters():
+        if param.requires_grad:
+            # BF16 storage rounds these small updates away near 1.0.
+            torch.testing.assert_close(param, torch.full_like(param, 0.9997), rtol=0, atol=1e-6)
+
+
 def test_fsdpturbo_sets_public_efsdp_gradient_divide_factor(monkeypatch):
     expert_parallel_module = pytest.importorskip("fsdp_turbo.distributed.expert_parallel.expert_parallel")
     expert_fully_shard_module = pytest.importorskip(

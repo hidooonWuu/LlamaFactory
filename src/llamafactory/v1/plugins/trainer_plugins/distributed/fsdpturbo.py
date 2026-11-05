@@ -313,9 +313,15 @@ class FSDPTurboFSDP2Engine(FSDP2Engine):
 
     def shard_model(self, model: HFModel) -> HFModel:
         """Set storage dtype before FSDP materialization without leaking backend config into ModelEngine."""
-        param_dtype = torch.bfloat16 if self.mixed_precision == "bf16" else torch.float32
-        model = model.to(param_dtype)
-        logger.info_rank0(f"Using {param_dtype} for FSDPTurbo full tuning.")
+        if self.is_lora_module_wrap(model):
+            # PEFT deliberately keeps trainable adapters in FP32. Casting the
+            # entire model to BF16 rounds every optimizer update and changes the
+            # training trajectory relative to FSDP2 with identical adapters.
+            logger.info_rank0("Preserving LoRA parameter storage dtype; mixed precision controls compute dtype.")
+        else:
+            param_dtype = torch.bfloat16 if self.mixed_precision == "bf16" else torch.float32
+            model = model.to(param_dtype)
+            logger.info_rank0(f"Using {param_dtype} for FSDPTurbo full tuning.")
         return super().shard_model(model)
 
     def _copy_weights(self, param, loaded_tensor):
@@ -366,7 +372,7 @@ class FSDPTurboFSDP2Engine(FSDP2Engine):
 
     @staticmethod
     def _freeze_expert_parallel_params(model: HFModel, ep_modules: list[str]) -> None:
-        """Keep the EP-managed expert parameters frozen in LoRA runs."""
+        """Freeze EP-managed base weights and preserve packed adapter trainability."""
         from fsdp_turbo.utils.str_match import module_name_match
 
         frozen = 0
@@ -374,9 +380,10 @@ class FSDPTurboFSDP2Engine(FSDP2Engine):
             if not any(module_name_match(pattern, name) for pattern in ep_modules):
                 continue
 
-            for param in module.parameters(recurse=True):
-                param.requires_grad_(False)
-                frozen += 1
+            adapter_params = getattr(module, "_expert_lora_trainable", {})
+            for param_name, param in module.named_parameters(recurse=True):
+                param.requires_grad_(adapter_params.get(param_name, False))
+                frozen += not param.requires_grad
 
         if frozen:
             logger.info_rank0(f"FSDPTurbo FSDP2: kept {frozen} routed expert parameters frozen for LoRA.")
@@ -411,6 +418,13 @@ class FSDPTurboFSDP2Engine(FSDP2Engine):
 
             ep_modules = spec.ep_modules
             ep_target_model = spec.prepare(ep_target_model)
+            has_expert_lora = any(getattr(module, "_expert_lora_specs", None) for module in ep_target_model.modules())
+            if has_expert_lora and (
+                self.ep_fsdp_size != 1 or self.dist_config.get("ep_dispatcher", "eager") != "eager"
+            ):
+                raise ValueError(
+                    "Ling expert LoRA currently requires ep_dispatcher=eager and DP size equal to EP size."
+                )
             ep_plan = EPPlanConfig(
                 apply_modules=ep_modules,
                 dispatcher=self.dist_config.get("ep_dispatcher", "eager"),
@@ -442,6 +456,11 @@ class FSDPTurboFSDP2Engine(FSDP2Engine):
                 # FSDPTurbo re-creates the sharded expert parameters with requires_grad=True, which
                 # would silently turn a LoRA run into a full tuning run of the routed experts.
                 self._freeze_expert_parallel_params(ep_target_model, ep_modules)
+                if has_expert_lora:
+                    from .expert_adapters.bailing_lora import enable_expert_lora_ep
+
+                    compute_dtype = torch.bfloat16 if self.mixed_precision == "bf16" else None
+                    enable_expert_lora_ep(ep_target_model, ep_mesh.get_group(), compute_dtype)
 
             if self.ep_fsdp_size > 1:
                 if self.rank == 0:

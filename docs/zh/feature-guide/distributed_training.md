@@ -47,7 +47,7 @@ dist_config:
 Ling 3.0（`model_type: bailing_hybrid`）的 remote code 把路由专家保存在 `nn.ModuleList` 中并用 Python 循环执行，FSDPTurbo 的专家并行需要融合后的 `gate_up_proj` / `down_proj` 布局，因此插件在切分模型前会把每个稀疏 MoE Block 的路由专家融合成一个专家模块，并重写该 Block 的 `forward`。由此带来两个限制：
 
 - 融合发生在切分阶段，融合后的参数名与 HF checkpoint 不再对应。`init_config: init_on_meta` 和 `init_on_rank0` 会跳过专家权重，因此被明确拒绝；不要配置 `init_config`，让 Transformers 先完成权重加载再切分。
-- 路由专家在 PEFT 注入时会被改写成分组矩阵乘，因此不能在路由专家上挂 LoRA。请把 `peft_config.target_modules` 写成 attention 投影的显式列表，而不要使用 `all`；或者保持 `ep_size: 1` 走纯 FSDP2 路径。
+- Ling 路由专家支持 `peft_config.target_modules: all`：先由 PEFT 注入 LoRA，再将 A/B 按专家轴打包并随基座分片；基座冻结，A/B 保持 FP32 存储。当前要求 `ep_dispatcher: eager`、`ep_size == dp_size`、单个普通加性 LoRA，专家间 rank/scaling/dropout 一致，不支持 DoRA 和适配器 bias。梯度按 EP 组平均，checkpoint 导出时还原标准 PEFT 参数名。其他不支持的专家 LoRA 布局会显式报错。
 
 `ep_size` 还需要整除路由专家数（Ling 3.0 tiny 为 128）。建议令 `ep_size` 等于 data parallel size，以避免产生专家分片维度：`first_k_dense_replace` 之前的层是 dense MLP，没有路由专家，而 EFSDP 计划匹配的是 `model.layers.{*}.mlp`，会把这些层也当作专家模块分片。
 

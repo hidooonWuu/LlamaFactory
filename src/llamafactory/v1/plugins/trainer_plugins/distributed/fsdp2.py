@@ -97,7 +97,21 @@ def _make_norms_dtype_safe(model: HFModel) -> int:
 
 def is_lora_model(model: HFModel) -> bool:
     """Return whether PEFT LoRA layers have already been injected into the model."""
-    return any(isinstance(module, LoraLayer) for module in model.modules())
+    return any(
+        isinstance(module, LoraLayer) or bool(getattr(module, "_expert_lora_specs", None))
+        for module in model.modules()
+    )
+
+
+class _FP32LoraDropout(nn.Module):
+    """Keep PEFT dropout rounding unchanged when adapters share an FSDP group."""
+
+    def __init__(self, p: float):
+        super().__init__()
+        self.p = p
+
+    def forward(self, inputs):
+        return torch.nn.functional.dropout(inputs.float(), self.p, self.training).to(inputs.dtype)
 
 
 def get_transformer_layer_cls(model: HFModel) -> set[type[nn.Module]]:
@@ -127,6 +141,9 @@ def get_transformer_layer_cls(model: HFModel) -> set[type[nn.Module]]:
 
 def _save_pretrained(model: HFModel, output_dir: str, state_dict: dict) -> None:
     """Serialize remote model code using its original class instead of FSDP2's generated wrapper."""
+    from .expert_adapters.bailing_lora import unpack_expert_lora_state_dict
+
+    state_dict = unpack_expert_lora_state_dict(model, state_dict)
     model_cls = type(model)
     if isinstance(model, FSDPModule) and getattr(model_cls, "_auto_class", None) is not None:
         # fully_shard creates a class with bases (FSDPModule, original_model_class).
@@ -263,8 +280,38 @@ class FSDP2Engine:
             return ignored_params.intersection(module.parameters()) or None
 
         if self.is_lora_module_wrap(model):
+            grouped_modules = set()
+            # Ling all-linear LoRA otherwise creates thousands of tiny FSDP
+            # groups. Group trainable adapters per MoE block, keeping frozen
+            # expert weights replicated and preserving standard PEFT keys.
+            if getattr(getattr(model, "config", None), "model_type", None) == "bailing_hybrid":
+                for module in list(model.modules()):
+                    experts = getattr(module, "experts", None)
+                    if not isinstance(experts, nn.ModuleList) or not any(
+                        isinstance(child, LoraLayer) for child in experts.modules()
+                    ):
+                        continue
+                    for child in module.modules():
+                        if isinstance(child, LoraLayer):
+                            for adapter, dropout in list(child.lora_dropout.items()):
+                                child.lora_dropout[adapter] = _FP32LoraDropout(getattr(dropout, "p", 0.0))
+                    frozen = {param for param in module.parameters() if not param.requires_grad}
+                    frozen.update(_ignored_params_for(module) or ())
+                    fully_shard(
+                        module,
+                        mesh=self.fsdp_mesh,
+                        reshard_after_forward=self.reshard_after_forward,
+                        mp_policy=mp_policy,
+                        offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+                        ignored_params=frozen,
+                    )
+                    grouped_modules.update(module.modules())
+                if grouped_modules:
+                    logger.info("Grouping Ling expert LoRA per MoE block; frozen experts remain replicated.")
             lora_modules = []
             for module in model.modules():
+                if module in grouped_modules:
+                    continue
                 if len(list(module.children())) != 0:
                     continue
                 if any(param.requires_grad for param in module.parameters(recurse=False)):

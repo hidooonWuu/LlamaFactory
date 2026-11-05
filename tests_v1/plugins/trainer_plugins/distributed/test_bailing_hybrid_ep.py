@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -167,12 +168,60 @@ def test_bailing_hybrid_fuses_only_once():
     assert model.model.layers[0].mlp.experts is fused
 
 
-def test_bailing_hybrid_rejects_lora_in_routed_experts():
+def test_bailing_hybrid_rejects_unrecognized_expert_lora_layout():
     model = _make_model()
     model.model.layers[0].mlp.experts[0].lora_A = torch.nn.Linear(4, 4)
 
     with pytest.raises(RuntimeError, match="LoRA adapters were found"):
         bailing_hybrid.prepare_for_ep(model)
+
+
+def _add_expert_lora(model):
+    from peft.tuners.lora.layer import Linear
+
+    for param in model.parameters():
+        param.requires_grad_(False)
+    for layer in model.model.layers:
+        for expert in layer.mlp.experts:
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                projection = Linear(getattr(expert, name), "default", r=2, lora_alpha=4, lora_dropout=0.0)
+                with torch.no_grad():
+                    projection.lora_B["default"].weight.normal_(std=0.02)
+                setattr(expert, name, projection)
+    return model
+
+
+def test_expert_lora_fusion_preserves_outputs_gradients_and_checkpoint_keys():
+    from llamafactory.v1.plugins.trainer_plugins.distributed.expert_adapters.bailing_lora import (
+        unpack_expert_lora_state_dict,
+    )
+
+    reference = _add_expert_lora(_make_model())
+    model = deepcopy(reference)
+    x = torch.randn(2, 3, HIDDEN_SIZE, requires_grad=True)
+    y = x.detach().clone().requires_grad_(True)
+    bailing_hybrid.prepare_for_ep(model)
+    expected = reference.model.layers[0].mlp(x)[0]
+    actual = model.model.layers[0].mlp(y)[0]
+    torch.testing.assert_close(actual, expected)
+    gradient = torch.randn_like(actual)
+    expected.backward(gradient)
+    actual.backward(gradient)
+    torch.testing.assert_close(x.grad, y.grad)
+    original = dict(reference.named_parameters())
+    unpacked = unpack_expert_lora_state_dict(model, dict(model.state_dict()))
+    for name, param in original.items():
+        if "lora_" in name:
+            torch.testing.assert_close(unpacked[name], param)
+    fused = model.model.layers[0].mlp.experts
+    for projection, spec in fused._expert_lora_specs.items():
+        for factor in ("A", "B"):
+            packed_grad = getattr(fused, spec[factor]).grad
+            for expert in range(NUM_EXPERTS):
+                key = f"model.layers.0.mlp.experts.{expert}.{projection}.lora_{factor}.default.weight"
+                expected_grad = original[key].grad
+                if expected_grad is not None:
+                    torch.testing.assert_close(packed_grad[expert], expected_grad)
 
 
 def test_bailing_hybrid_rejects_meta_init():
@@ -201,3 +250,37 @@ def test_other_models_keep_the_requested_attention():
     engine.args = SimpleNamespace(flash_attn=AttentionFunction.FLASH_ATTENTION_2)
 
     assert engine._resolve_attn_implementation() == "flash_attention_2"
+
+
+def test_grouped_lora_dropout_keeps_fp32_mask_rounding():
+    from llamafactory.v1.plugins.trainer_plugins.distributed.fsdp2 import _FP32LoraDropout
+
+    x = torch.linspace(-2, 2, 128, dtype=torch.bfloat16, requires_grad=True)
+    dropout = _FP32LoraDropout(0.05)
+    torch.manual_seed(17)
+    expected = F.dropout(x.float(), p=0.05, training=True).to(x.dtype)
+    torch.manual_seed(17)
+    actual = dropout(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.float().sum().backward()
+    assert torch.isfinite(x.grad).all()
+    dropout.eval()
+    torch.testing.assert_close(dropout(x), x, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mismatch", ["rank", "dropout", "scaling", "dora", "active_adapter"])
+def test_expert_lora_rejects_inconsistent_or_unsupported_layouts(mismatch):
+    model = _add_expert_lora(_make_model())
+    layer = model.model.layers[0].mlp.experts[1].gate_proj
+    if mismatch == "rank":
+        layer.lora_A["default"] = torch.nn.Linear(HIDDEN_SIZE, 3, bias=False)
+    elif mismatch == "dropout":
+        layer.lora_dropout["default"] = torch.nn.Dropout(0.1)
+    elif mismatch == "scaling":
+        layer.scaling["default"] *= 2
+    elif mismatch == "dora":
+        layer.use_dora["default"] = True
+    else:
+        layer.set_adapter(["default", "other"])
+    with pytest.raises(ValueError, match="Expert LoRA|Ling EP"):
+        bailing_hybrid.prepare_for_ep(model)

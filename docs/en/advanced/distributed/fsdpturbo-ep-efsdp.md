@@ -28,7 +28,7 @@ The fields used by the minimal example have the following responsibilities:
 
 `dp_size`, `cp_size`, `cp_mode`, `mp_replicate_size`, `mp_shard_size`, and `dist_timeout` are common topology fields and therefore remain at the top level. `dist_config` is parsed strictly as `FSDPTurboParams`; putting a common topology field inside it is rejected instead of being silently ignored.
 
-The top-level training option `bf16` controls FSDPTurbo parameter storage and compute dtype. The backend casts the model before FSDP materialization, so `ModelEngine` does not need to read distributed-backend configuration.
+The top-level training option `bf16` controls FSDPTurbo's mixed-precision compute dtype. For full tuning, the backend also casts model storage before FSDP materialization. For LoRA, it preserves PEFT's FP32 adapter storage so optimizer updates match native FSDP2; casting the entire PEFT model to BF16 would introduce additional rounding on each update. `ModelEngine` does not need to read distributed-backend configuration.
 
 The following advanced fields are optional and are therefore omitted from the minimal YAML example above:
 
@@ -40,10 +40,12 @@ The model spec determines the EFSDP targets. Non-expert parameters such as atten
 
 Model-specific module paths and preparation logic are managed exclusively by the `FSDPTurboEPModelSpec` registry. Built-in specs currently cover `qwen3_moe`, `qwen3_5_moe`, and `bailing_hybrid`; unregistered models fail with an explicit error. `ep_modules` and `ep_fsdp_modules` are not YAML options, and strict parameter parsing rejects them to prevent configuration from drifting away from the actual model structure.
 
-`bailing_hybrid` (Ling 3.0 / BailingMoE V3 remote code) keeps the routed experts in an `nn.ModuleList` and runs them with a Python loop, which is not the fused layout the EP dispatcher consumes. The spec therefore rewrites the routed experts of every sparse MoE block into one fused block exposing `gate_up_proj` / `down_proj` / `hidden_dim` and the `(hidden_states, top_k_index, top_k_weights)` entry point, and rewrites the MoE block `forward` to call it. Two constraints follow from that rewrite:
+`bailing_hybrid` (Ling 3.0 / BailingMoE V3 remote code) keeps the routed experts in an `nn.ModuleList` and runs them with a Python loop, which is not the fused layout the EP dispatcher consumes. The spec therefore rewrites the routed experts of every sparse MoE block into one fused block exposing `gate_up_proj` / `down_proj` / `hidden_dim` and the `(hidden_states, top_k_index, top_k_weights)` entry point, and rewrites the MoE block `forward` to call it. The rewrite has the following implications:
 
 - The fusion happens at sharding time, so the fused parameter names no longer match the Hugging Face checkpoint keys. `init_config: init_on_meta` and `init_on_rank0` would silently skip the expert weights and are rejected; leave `init_config` unset so the weights are loaded by Transformers before sharding.
-- LoRA cannot be injected into the routed experts, because they no longer exist as `nn.Linear` layers when PEFT runs. List the attention projections in `peft_config.target_modules` instead of `all`, or keep `ep_size: 1` and use the plain FSDP2 path.
+- Ling routed-expert LoRA is injected by PEFT before expert fusion. LlamaFactory packs A/B separately on the expert axis, shards them with the frozen experts, and uses the existing eager token dispatcher with a LoRA-aware local expert computation. `target_modules: all` therefore includes routed experts, shared experts, dense MLPs and attention. This path currently requires `ep_dispatcher: eager`, `ep_size == dp_size`, one active additive adapter, uniform ranks/scaling/dropout across experts, and no DoRA or adapter bias. Unsupported layouts fail explicitly.
+- Expert A/B gradients are averaged over the EP group, while input gradients retain the normal token-routing semantics. Adapter storage remains FP32. Gathered adapter checkpoints are expanded back into standard per-expert PEFT keys for loading into the original unfused model.
+- Native FSDP2 groups Ling expert adapters per MoE block to avoid thousands of tiny collectives. Frozen expert base weights remain replicated in this LoRA grouping path; adapter parameters are sharded. This changes memory usage, while preserving PEFT computation and checkpoint keys.
 
 `ep_size` must divide the data parallel size and the number of routed experts (128 for Ling 3.0 tiny). Keep `ep_size` equal to the data parallel size so that no expert fully-sharded dimension is created: the layers below `first_k_dense_replace` are dense MLPs without routed experts, and an EFSDP plan matching `model.layers.{*}.mlp` would shard them as expert modules as well.
 
